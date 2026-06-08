@@ -14,6 +14,7 @@ struct _FuElanTsDevice {
 	FuElanTsState touch_state; /* operating mode state */
 	guint16 bc_version;	   /* boot code */
 	guint16 fw_id;
+	guint16 remark_id;
 	guint16 fw_version;
 	guint16 test_version;
 };
@@ -513,11 +514,11 @@ fu_elan_ts_device_read_rom_data(FuElanTsDevice *self,
 /* the Remark ID is essential for identifying hardware sub-models and ensuring
  * that the firmware image is fully compatible with the physical touch controller */
 static gboolean
-fu_elan_ts_device_read_remark_id(FuElanTsDevice *self, guint16 *remark_id, GError **error)
+fu_elan_ts_device_ensure_remark_id(FuElanTsDevice *self, GError **error)
 {
 	if (!fu_elan_ts_device_read_rom_data(self,
 					     FU_ELAN_TS_MEM_ADDR_REMARK_ID,
-					     remark_id,
+					     &self->remark_id,
 					     error)) {
 		g_prefix_error_literal(error, "failed to read remark id from ROM: ");
 		return FALSE;
@@ -822,6 +823,10 @@ fu_elan_ts_device_setup(FuDevice *device, GError **error)
 			    "failed to read test-solution version in normal mode: ");
 			return FALSE;
 		}
+		if (!fu_elan_ts_device_ensure_remark_id(self, error)) {
+			g_prefix_error_literal(error, "failed to get remark id in normal mode: ");
+			return FALSE;
+		}
 
 		/* display combined fw and test versions in the main version field */
 		version = g_strdup_printf("%x.%x", self->fw_version, self->test_version);
@@ -863,6 +868,8 @@ fu_elan_ts_device_to_string(FuDevice *device, guint idt, GString *str)
 	if (self->touch_state == FU_ELAN_TS_STATE_NORMAL_MODE) {
 		if (self->fw_id != 0)
 			fwupd_codec_string_append_hex(str, idt, "FwId", self->fw_id);
+		if (self->remark_id != 0)
+			fwupd_codec_string_append_hex(str, idt, "RemarkId", self->remark_id);
 		if (self->fw_version != 0)
 			fwupd_codec_string_append_hex(str, idt, "FwVersion", self->fw_version);
 		fwupd_codec_string_append_hex(str, idt, "TestVersion", self->test_version);
@@ -999,27 +1006,27 @@ fu_elan_ts_device_iap_check_remark_id(FuElanTsDevice *self,
 				      FuElanTsFirmware *firmware,
 				      GError **error)
 {
-	guint16 remark_id_device = 0;
 	guint16 remark_id_fw = 0;
+	FuElanTsDebugSetting debug_setting = fu_elan_ts_firmware_get_debug_setting(firmware);
+
+	/* firmware tells us to skip */
+	if (debug_setting & FU_ELAN_TS_DEBUG_SETTING_SKIP_REMARK_ID_CHECK)
+		return TRUE;
 
 	/* get remark id from hardware rom - this is a mandatory prerequisite */
-	if (!fu_elan_ts_device_read_remark_id(self, &remark_id_device, error)) {
-		g_prefix_error_literal(error, "failed to get Remark ID from ROM: ");
-		return FALSE;
-	}
-	if (remark_id_device == FU_ELAN_TS_REMARK_ID_NONE) {
-		g_debug("non-remark ic (0x%04x), bypassing check", remark_id_device);
+	if (self->remark_id == FU_ELAN_TS_REMARK_ID_NONE) {
+		g_debug("non-remark ic (0x%04x), bypassing check", self->remark_id);
 		return TRUE;
 	}
 
 	/* strict match required for remark ics */
 	remark_id_fw = fu_elan_ts_firmware_get_remark_id(firmware);
-	if (remark_id_device != remark_id_fw) {
+	if (self->remark_id != remark_id_fw) {
 		g_set_error(error,
 			    FWUPD_ERROR,
 			    FWUPD_ERROR_INVALID_DATA,
 			    "remark ID mismatched (ROM: 0x%04x, FW: 0x%04x)",
-			    remark_id_device,
+			    self->remark_id,
 			    remark_id_fw);
 		return FALSE;
 	}
@@ -1035,8 +1042,6 @@ fu_elan_ts_device_check_firmware(FuDevice *device,
 				 GError **error)
 {
 	FuElanTsDevice *self = FU_ELAN_TS_DEVICE(device);
-	FuElanTsDebugSetting debug_setting;
-	gboolean skip_remark_id_check;
 	gboolean remark_id_check = FALSE;
 
 	/* check type */
@@ -1051,8 +1056,6 @@ fu_elan_ts_device_check_firmware(FuDevice *device,
 	}
 
 	/* remark id compatibility check */
-	debug_setting = fu_elan_ts_firmware_get_debug_setting(FU_ELAN_TS_FIRMWARE(firmware));
-	skip_remark_id_check = (debug_setting & FU_ELAN_TS_DEBUG_SETTING_SKIP_REMARK_ID_CHECK) != 0;
 	if (self->touch_state == FU_ELAN_TS_STATE_NORMAL_MODE) {
 		guint8 iap_version = (guint8)(self->bc_version & 0x00FF);
 		if (iap_version >= 0x60)
@@ -1063,7 +1066,7 @@ fu_elan_ts_device_check_firmware(FuDevice *device,
 		if (bc_hbyte != bc_lbyte)
 			remark_id_check = TRUE;
 	}
-	if (remark_id_check && !skip_remark_id_check) {
+	if (remark_id_check) {
 		if (!fu_elan_ts_device_iap_check_remark_id(self,
 							   FU_ELAN_TS_FIRMWARE(firmware),
 							   error)) {
